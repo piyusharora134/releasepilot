@@ -1,0 +1,13 @@
+spring:
+  application:
+    name: releasepilot
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/releasepilot
+    username: releasepilot
+    password: releasepilot
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
