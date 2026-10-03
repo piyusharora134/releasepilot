@@ -1,29 +1,24 @@
 # ReleasePilot
 
-ReleasePilot is a feature flag and progressive rollout platform designed to help teams safely release, control, and monitor application features.
+ReleasePilot is a **feature flag and progressive rollout platform** that helps teams safely release, control, and monitor application features across environments.
 
-The project is being built as a production-oriented SaaS backend with a focus on clean architecture, secure APIs, database versioning, progressive delivery, and scalable infrastructure.
+Built as a production-oriented SaaS with a Spring Boot backend, React dashboard, PostgreSQL, optional Redis caching, and OpenAI-powered release insights.
 
-## Current Status
+## Features
 
-Under active development
+- **Authentication** — JWT register/login with auto-provisioned organization
+- **Multi-tenancy** — organizations, projects, environments (dev/staging/prod auto-created)
+- **Feature flags** — boolean, string, numeric, and JSON types
+- **Targeting rules** — attribute-based rules with priority ordering
+- **Percentage rollouts** — deterministic user bucketing via consistent hashing
+- **SDK evaluation API** — public endpoints authenticated with per-environment API keys
+- **Audit logging** — full trail of org/project/environment/flag mutations
+- **Release insights** — traffic distribution analysis with optional OpenAI summaries
+- **React dashboard** — manage projects, flags, sandbox evaluations, audit logs, SDK snippets
+- **OpenAPI docs** — Swagger UI at `/swagger-ui.html`
+- **Health checks** — Spring Actuator at `/actuator/health`
 
-### Currently Implemented
-
-- Spring Boot 4.1.0
-- Java 21 LTS
-- Maven
-- Spring Web
-- Spring Data JPA
-- Spring Security
-- Jakarta Validation
-- PostgreSQL 17
-- Docker Compose
-- Lombok
-- Spring Boot DevTools
-- GitHub-based version control
-
-## Planned Architecture
+## Architecture
 
 ```text
                     ReleasePilot
@@ -31,8 +26,8 @@ Under active development
               ┌──────────┴──────────┐
               │                     │
            Frontend              Backend
-        React + TypeScript      Spring Boot
-              │                     │
+        React + TypeScript      Spring Boot 4
+         (Vite + Tailwind)           │
               │              ┌──────┴──────┐
               │              │             │
               │           PostgreSQL     Redis
@@ -40,174 +35,125 @@ Under active development
               └────────────── API ─────────┘
 ```
 
-## Core Features
+## Tech Stack
 
-The platform will eventually provide:
+| Layer | Technologies |
+|-------|-------------|
+| Backend | Java 21, Spring Boot 4.1, Spring Security, JPA, Flyway, Redis, Actuator, springdoc-openapi |
+| Frontend | React 19, TypeScript, Tailwind CSS 4, Vite, React Router, Playwright |
+| Data | PostgreSQL 17 |
+| Infra | Docker Compose, GitHub Actions CI |
 
-- User authentication and authorization
-- Organizations and projects
-- Multiple deployment environments
-- Feature flag management
-- Targeting rules
-- Percentage-based rollouts
-- Progressive releases
-- Feature flag evaluation APIs
-- Audit logging
-- Release monitoring
-- API access for applications
-- Secure JWT-based authentication
-
-## Technology Stack
-
-### Backend
-
-- Java 21
-- Spring Boot
-- Spring Security
-- Spring Data JPA
-- PostgreSQL
-- Flyway *(planned)*
-- Maven
-
-### Infrastructure
-
-- Docker
-- Docker Compose
-- Redis *(planned)*
-- GitHub Actions *(planned)*
-
-### Frontend *(planned)*
-
-- React
-- TypeScript
-- Tailwind CSS
-
-### Future AI Integration
-
-- OpenAI API
-- AI-assisted release analysis and insights
-
-## Local Development
+## Quick Start
 
 ### Prerequisites
 
-Make sure the following are installed:
+- **Java 21** (required — see `.java-version`)
+- **Node.js 20+** (for frontend)
+- **Docker Desktop** (for PostgreSQL/Redis/full stack)
 
-- Java 21
-- Docker Desktop
-- Git
-
-### Start PostgreSQL
+### 1. Start infrastructure
 
 ```bash
-docker compose up -d
+docker compose up -d postgres redis
 ```
 
-Check the database container:
+### 2. Run backend
 
 ```bash
-docker compose ps
-```
+# Windows
+.\mvnw.cmd spring-boot:run
 
-### Run the application
-
-Right now, the verified way to run ReleasePilot locally is from IntelliJ IDEA with this VM option set:
-
-```text
--Duser.timezone=Asia/Kolkata
-```
-
-The app hasn't been confirmed to run correctly without it, so treat it as required for now.
-
-The Maven wrapper commands below are expected to work too, but they haven't been verified as a standalone startup path yet:
-
-Using Maven:
-
-```bash
+# Linux/macOS
 ./mvnw spring-boot:run
 ```
 
-On Windows:
+Backend: `http://localhost:8080`  
+Swagger UI: `http://localhost:8080/swagger-ui.html`  
+Health: `http://localhost:8080/actuator/health`
+
+### 3. Run frontend
 
 ```bash
-.\mvnw.cmd spring-boot:run
+cd frontend
+npm install
+npm run dev
 ```
 
-This section will be updated once a final local-run configuration is settled (e.g. moving the timezone setting into `application.yaml`).
+Dashboard: `http://localhost:5173`
 
-The application runs on `http://localhost:8080`.
-
-### Run tests
-
-Linux/macOS:
+### Full Docker stack
 
 ```bash
-./mvnw test
+docker compose up -d --build
 ```
 
-Windows:
+Runs postgres + redis + backend on `:8080`.
+
+Copy `.env.example` to `.env` and customize secrets before production use.
+
+## Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REDIS_ENABLED` | `false` | Enable evaluation result caching |
+| `OPENAI_ENABLED` | `false` | Enable AI release insight summaries |
+| `OPENAI_API_KEY` | — | OpenAI API key |
+| `JWT_SECRET` | dev default | JWT signing secret (**change in prod**) |
+
+See [`application.yaml`](src/main/resources/application.yaml) and [`.env.example`](.env.example) for all options.
+
+## API Overview
+
+| Module | Path | Auth |
+|--------|------|------|
+| Auth | `/api/v1/auth` | Public |
+| Organizations | `/api/v1/organizations` | JWT |
+| Projects | `/api/v1/projects` | JWT |
+| Feature Flags | `/api/v1/flags` | JWT |
+| SDK Evaluation | `/api/v1/eval` | API Key (`X-API-Key`) |
+| Audit Logs | `/api/v1/audit-logs` | JWT |
+| Insights | `/api/v1/insights` | JWT |
+
+## Testing
+
+### Backend
 
 ```bash
-.\mvnw.cmd test
+.\mvnw.cmd test    # Windows
+./mvnw test        # Linux/macOS
+```
+
+Uses Testcontainers (PostgreSQL) — Docker required for integration tests.
+
+### Frontend E2E
+
+```bash
+cd frontend
+npm install
+npx playwright install chromium
+npm run test:e2e
 ```
 
 ## Project Structure
 
-The backend will follow a feature-oriented architecture as the project grows:
-
 ```text
-src/
-├── main/
-│   ├── java/
-│   │   └── com/
-│   │       └── releasepilot/
-│   │           ├── auth/
-│   │           ├── organization/
-│   │           ├── project/
-│   │           ├── featureflag/
-│   │           ├── rollout/
-│   │           ├── audit/
-│   │           └── common/
-│   │
-│   └── resources/
-│       ├── application.yaml
-│       └── db/
-│           └── migration/
-│
-└── test/
+releasepilot/
+├── src/main/java/com/releasepilot/   # Backend (feature-oriented packages)
+├── src/test/                         # Unit + integration tests
+├── src/main/resources/db/migration/  # Flyway migrations V1–V4
+├── frontend/                         # React dashboard
+├── docker-compose.yaml               # postgres + redis + app
+├── Dockerfile                        # Backend container
+├── .github/workflows/ci.yml          # CI pipeline
+└── DEVLOG.md                         # Development log
 ```
 
-The exact structure will evolve as features are implemented.
+## Development
 
-## Development Approach
+Progress and decisions are tracked in [`DEVLOG.md`](./DEVLOG.md).
 
-ReleasePilot is being developed incrementally using the following workflow:
-
-1. Understand the requirement
-2. Design the solution
-3. Implement the feature
-4. Test the implementation
-5. Document the change
-6. Commit the change
-
-The project prioritizes:
-
-- Clean code
-- SOLID principles
-- Separation of concerns
-- DTO-based APIs
-- Validation
-- Centralized exception handling
-- Database migrations
-- Secure authentication
-- Reproducible development environments
-- Production-oriented design
-
-## Documentation
-
-Development progress is tracked in [`DEVLOG.md`](./DEVLOG.md).
-
-Additional technical documentation will be added under `docs/` as the project grows.
+Workflow: design → implement → test → document → commit.
 
 ## License
 

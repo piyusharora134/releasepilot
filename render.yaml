@@ -1,0 +1,30 @@
+databases:
+  - name: releasepilot-db
+    databaseName: releasepilot
+    user: releasepilot
+    plan: free
+
+services:
+  - type: web
+    name: releasepilot-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /actuator/health
+    envVars:
+      - key: SPRING_DATASOURCE_URL
+        fromDatabase:
+          name: releasepilot-db
+          property: connectionString
+      - key: SPRING_DATASOURCE_USERNAME
+        fromDatabase:
+          name: releasepilot-db
+          property: user
+      - key: SPRING_DATASOURCE_PASSWORD
+        fromDatabase:
+          name: releasepilot-db
+          property: password
+      - key: REDIS_ENABLED
+        value: "false"
+      - key: JWT_SECRET
+        generateValue: true

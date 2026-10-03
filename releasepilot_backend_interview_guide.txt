@@ -1,0 +1,1010 @@
+================================================================================
+RELEASEPILOT — COMPLETE BACKEND INTERVIEW PREPARATION GUIDE
+================================================================================
+Targeted for: Backend Engineer / System Design Interview
+Based strictly on: ReleasePilot Spring Boot 4.1 / Java 21 Codebase
+================================================================================
+
+
+==================================================
+1. BACKEND PROJECT OVERVIEW
+==================================================
+
+What ReleasePilot Does:
+ReleasePilot is a multi-tenant Feature Flag and Progressive Rollout SaaS backend. It provides centralized feature flag lifecycle management, deterministic percentage-based progressive rollouts, attribute-based user targeting rules, evaluation result caching, mutation audit logging, and OpenAI-powered rollout insights.
+
+What Problem It Solves:
+It decouples software deployment from feature release. Engineering teams can push code to production behind feature flags and safely toggle features ON/OFF, run canary/A-B test rollouts to specific user subsets, or instantly kill malfunctioning code in real-time without redeploying applications or restarting servers.
+
+Backend Responsibilities:
+1. Multi-tenant Org & Project Isolation (JWT authenticated CRUD APIs for Orgs, Projects, Environments, Flags, Rules).
+2. Ultra-low Latency Rule & Flag Evaluation Engine (< 5ms) for external applications via API Keys.
+3. Deterministic Consistent Hashing (SHA-256) for percentage-based rollout bucketing.
+4. Distributed Cache Management (Spring Cache abstraction over Redis).
+5. Mutation Audit Trail Persistence & Async Evaluation Activity Logging.
+6. External AI Integration for rollout risk assessment (OpenAI Chat Completions).
+
+Tech Stack:
+- Programming Language: Java 21
+- Framework: Spring Boot 4.1.0
+- Security: Spring Security 6.x (Stateless JWT + Custom API Key filter logic)
+- Database: PostgreSQL 17 (relational persistence)
+- ORM / Persistence: Spring Data JPA / Hibernate 6.x
+- Database Migrations: Flyway (SQL migrations V1–V4)
+- Cache: Redis 7 (Spring Data Redis with GenericJackson2JsonRedisSerializer)
+- API Documentation: springdoc-openapi 3.1 (Swagger UI at /swagger-ui.html)
+- Serialization: Jackson ObjectMapper
+- Build Tool: Maven (Java 21 target)
+- Containerization: Docker & Docker Compose (multi-stage Dockerfile)
+
+Backend Architecture:
+ReleasePilot strictly follows a layered REST Controller -> Service -> Repository -> Database architecture.
+
+                 [ External Application / Client ]
+                               │
+            ┌──────────────────┴──────────────────┐
+            │                                     │
+      JWT Admin API                       SDK Evaluation API
+ (Bearer token in Header)                 (X-API-Key in Header)
+            │                                     │
+            ▼                                     ▼
+ ┌──────────────────────────────────────────────────────────────┐
+ │                    Spring Security Filter Chain               │
+ │    JwtAuthenticationFilter (SecurityContextHolder populate)  │
+ └──────────────────────────────┬───────────────────────────────┘
+                                │
+                                ▼
+ ┌──────────────────────────────────────────────────────────────┐
+ │                      REST Controllers                        │
+ │  (AuthController, ProjectController, FeatureFlagController,  │
+ │              EvaluationController, InsightController)        │
+ └──────────────────────────────┬───────────────────────────────┘
+                                │
+                                ▼
+ ┌──────────────────────────────────────────────────────────────┐
+ │                      Service Layer                           │
+ │   (AuthService, FeatureFlagService, EvaluationService,       │
+ │               InsightService, AuditLogWriter)                │
+ └─────────────┬────────────────┬─────────────────┬─────────────┘
+               │                │                 │
+               ▼                ▼                 ▼
+     ┌──────────────────┐ ┌──────────┐ ┌────────────────────────┐
+     │  Spring Cache    │ │ OpenAI   │ │  JPA Repositories      │
+     │  (Redis Store)   │ │ Client   │ │ (PostgreSQL DB via JPA)│
+     └──────────────────┘ └──────────┘ └────────────────────────┘
+
+Where Features Fit:
+- JWT: Evaluated in JwtAuthenticationFilter before hitting Controllers.
+- Redis: Intercepts EvaluationService.evaluateFlag() using Spring CacheManager.
+- Feature Flag Evaluation & Progressive Rollout: Executed in EvaluationService.performEvaluation() & HashUtils.getBucket().
+- Flyway: Runs at Spring Boot startup before Hibernate initializes schema or processes queries.
+
+
+==================================================
+2. BACKEND CODEBASE MAP
+==================================================
+
+CONTROLLERS (src/main/java/com/releasepilot/*/):
+1. AuthController (com.releasepilot.auth)
+   - Purpose: Endpoints for user registration and JWT login.
+   - Methods: register(), login()
+   - Called By: Public HTTP clients (/api/v1/auth/**)
+   - Calls: AuthService
+
+2. OrganizationController (com.releasepilot.organization)
+   - Purpose: Organization management and member listing.
+   - Methods: createOrganization(), getMyOrganizations(), getOrganizationMembers()
+   - Called By: JWT Authenticated Admin Users (/api/v1/organizations/**)
+   - Calls: OrganizationService
+
+3. ProjectController (com.releasepilot.project)
+   - Purpose: Project and environment management, API key regeneration.
+   - Methods: createProject(), getProjects(), getProjectById(), regenerateApiKey()
+   - Called By: JWT Authenticated Admin Users (/api/v1/projects/**)
+   - Calls: ProjectService
+
+4. FeatureFlagController (com.releasepilot.feature)
+   - Purpose: Feature flag CRUD, environment toggles, targeting & rollout rules.
+   - Methods: createFlag(), getFlagsByProject(), getFlagById(), updateFlag(), updateFlagEnvironment(), addTargetingRule(), deleteTargetingRule(), setRolloutRule(), deleteFlag()
+   - Called By: JWT Authenticated Admin Users (/api/v1/flags/**)
+   - Calls: FeatureFlagService
+
+5. EvaluationController (com.releasepilot.feature)
+   - Purpose: SDK public endpoints for flag evaluation.
+   - Methods: evaluateFlag(), evaluateAllFlags()
+   - Called By: External Applications via HTTP X-API-Key (/api/v1/eval/**)
+   - Calls: EvaluationService
+
+6. AuditLogController (com.releasepilot.audit)
+   - Purpose: Retrieves audit trail logs for organizations.
+   - Methods: getAuditLogs()
+   - Called By: JWT Authenticated Admin Users (/api/v1/audit-logs/**)
+   - Calls: AuditLogRepository
+
+7. InsightController (com.releasepilot.audit)
+   - Purpose: Retrieves AI rollout health summaries for flags.
+   - Methods: getFlagInsights()
+   - Called By: JWT Authenticated Admin Users (/api/v1/insights/**)
+   - Calls: InsightService
+
+SERVICES:
+1. AuthService (com.releasepilot.auth)
+   - Purpose: Authentication logic, user creation, org auto-provisioning.
+   - Calls: UserRepository, OrganizationRepository, PasswordEncoder, JwtTokenProvider, AuthenticationManager
+
+2. OrganizationService (com.releasepilot.organization)
+   - Purpose: Manages org creation and member authorization.
+   - Calls: OrganizationRepository, UserRepository
+
+3. ProjectService (com.releasepilot.project)
+   - Purpose: Manages project creation, environment auto-provisioning (dev, staging, prod), API key generation.
+   - Calls: ProjectRepository, EnvironmentRepository, AuditLogWriter
+
+4. FeatureFlagService (com.releasepilot.feature)
+   - Purpose: Manages flag lifecycle, environment overrides, rule creation/deletion.
+   - Calls: FeatureFlagRepository, FlagEnvironmentRepository, TargetingRuleRepository, RolloutRuleRepository, EnvironmentRepository, AuditLogWriter, ObjectMapper
+
+5. EvaluationService (com.releasepilot.feature)
+   - Purpose: Core evaluation pipeline, consistent hashing rollout execution, Redis caching, evaluation log persistence.
+   - Calls: EnvironmentRepository, FeatureFlagRepository, FlagEnvironmentRepository, TargetingRuleRepository, RolloutRuleRepository, EvaluationLogRepository, CacheManager, HashUtils, ObjectMapper
+
+6. InsightService (com.releasepilot.audit)
+   - Purpose: Aggregates evaluation statistics, risk assessment, OpenAI client invocation.
+   - Calls: EvaluationLogRepository, EnvironmentRepository, OpenAiInsightClient
+
+7. AuditLogWriter (com.releasepilot.audit)
+   - Purpose: Centralized helper to save immutable audit log entries.
+   - Calls: AuditLogRepository
+
+8. CustomUserDetailsService (com.releasepilot.security)
+   - Purpose: Bridge between Spring Security and UserRepository.
+   - Calls: UserRepository
+
+REPOSITORIES:
+1. UserRepository (com.releasepilot.user) -> DB Table: users
+2. OrganizationRepository (com.releasepilot.organization) -> DB Table: organizations
+3. ProjectRepository (com.releasepilot.project) -> DB Table: projects
+4. EnvironmentRepository (com.releasepilot.project) -> DB Table: environments
+5. FeatureFlagRepository (com.releasepilot.feature) -> DB Table: feature_flags
+6. FlagEnvironmentRepository (com.releasepilot.feature) -> DB Table: flag_environments
+7. TargetingRuleRepository (com.releasepilot.feature) -> DB Table: targeting_rules
+8. RolloutRuleRepository (com.releasepilot.feature) -> DB Table: rollout_rules
+9. AuditLogRepository (com.releasepilot.audit) -> DB Table: audit_logs
+10. EvaluationLogRepository (com.releasepilot.audit) -> DB Table: evaluation_logs
+
+ENTITIES:
+- User (com.releasepilot.user.User)
+- Organization (com.releasepilot.organization.Organization)
+- OrganizationMember (com.releasepilot.organization.OrganizationMember)
+- Project (com.releasepilot.project.Project)
+- Environment (com.releasepilot.project.Environment)
+- FeatureFlag (com.releasepilot.feature.FeatureFlag)
+- FlagEnvironment (com.releasepilot.feature.FlagEnvironment)
+- TargetingRule (com.releasepilot.feature.TargetingRule)
+- RolloutRule (com.releasepilot.feature.RolloutRule)
+- AuditLog (com.releasepilot.audit.AuditLog)
+- EvaluationLog (com.releasepilot.audit.EvaluationLog)
+
+SECURITY & CONFIGURATION:
+- SecurityConfig (com.releasepilot.security.SecurityConfig): SecurityFilterChain bean, permits public endpoints, adds JWT filter.
+- JwtTokenProvider (com.releasepilot.security.JwtTokenProvider): HMAC-SHA256 token generation and validation.
+- JwtAuthenticationFilter (com.releasepilot.security.JwtAuthenticationFilter): Intercepts requests, validates JWT, populates SecurityContext.
+- PasswordEncoderConfig (com.releasepilot.security.PasswordEncoderConfig): BCryptPasswordEncoder bean definition.
+- RedisCacheConfig (com.releasepilot.config.RedisCacheConfig): Conditional RedisCacheManager configuration with JSON serializer.
+- OpenAiProperties (com.releasepilot.config.OpenAiProperties): Configuration properties bound to "openai" prefix.
+- ReleasePilotProperties (com.releasepilot.config.ReleasePilotProperties): Configuration properties for application caching.
+- OpenApiConfig (com.releasepilot.config.OpenApiConfig): Swagger UI configuration with JWT Bearer & API Key security schemes.
+
+UTILITIES & CLIENTS:
+- HashUtils (com.releasepilot.common.HashUtils): Bitwise SHA-256 integer bucketing in range [0, 99].
+- OpenAiInsightClient (com.releasepilot.audit.OpenAiInsightClient): Native Java HttpClient for OpenAI REST endpoint.
+- GlobalExceptionHandler (com.releasepilot.common.GlobalExceptionHandler): ControllerAdvice returning standardized ApiResponse errors.
+
+
+==================================================
+3. CONTROLLER → SERVICE → REPOSITORY ARCHITECTURE
+==================================================
+
+Why ReleasePilot Separates Layers:
+1. Controller Layer: Handles HTTP protocol concerns (request mapping, path variables, DTO validation, HTTP status code wrapping).
+2. Service Layer: Contains core business logic, transaction boundaries (@Transactional), rule evaluation algorithms, caching, and cross-cutting audit invocation. Completely decoupled from HTTP request/response objects.
+3. Repository Layer: Encapsulates database access queries using Spring Data JPA abstractions, decoupling domain logic from SQL persistence.
+
+Complete Trace 1: SDK Flag Evaluation (POST /api/v1/eval/evaluate)
+
+1. HTTP Request:
+   Headers: X-API-Key: dev_key_123, Content-Type: application/json
+   Body: {"flagKey": "new-checkout", "context": {"userId": "usr_99", "country": "US"}}
+
+2. Controller:
+   FILE: src/main/java/com/releasepilot/feature/EvaluationController.java
+   CLASS: EvaluationController
+   METHOD: evaluateFlag(@RequestHeader("X-API-Key") String apiKey, @Valid @RequestBody EvaluateRequest request)
+   Action: Extracts header and body, calls evaluationService.evaluateFlag(apiKey, request).
+
+3. Service:
+   FILE: src/main/java/com/releasepilot/feature/EvaluationService.java
+   CLASS: EvaluationService
+   METHOD: evaluateFlag(String apiKey, EvaluateRequest request)
+   Action:
+   a. Fetches Environment by apiKey via environmentRepository.findByApiKey(apiKey).
+   b. Fetches FeatureFlag by projectId and flagKey via featureFlagRepository.findByProjectIdAndKey(...).
+   c. Generates cache key using SHA-256 digest ofTreeMap(context).
+   d. Checks Redis via getCachedResult(cacheKey). If hit, returns immediately.
+   e. If miss, calls performEvaluation(flag, environment, context).
+   f. Writes evaluation log asynchronously to evaluationLogRepository.save(log).
+
+4. Repository:
+   FILE: src/main/java/com/releasepilot/project/EnvironmentRepository.java
+   METHOD: findByApiKey(String apiKey)
+   Query executed: SELECT * FROM environments WHERE api_key = ?
+
+   FILE: src/main/java/com/releasepilot/feature/FeatureFlagRepository.java
+   METHOD: findByProjectIdAndKey(UUID projectId, String key)
+   Query executed: SELECT * FROM feature_flags WHERE project_id = ? AND key = ?
+
+5. PostgreSQL: Executes queries over indexed columns (api_key, project_id, key).
+
+6. Response: Returns HTTP 200 OK with ApiResponse<EvaluationResultDto>:
+   {"success": true, "data": {"flagKey": "new-checkout", "value": true, "reason": "TARGET_MATCH", "environmentKey": "dev"}}
+
+
+==================================================
+4. DATABASE / JPA / HIBERNATE
+==================================================
+
+PostgreSQL Configuration:
+Configured in src/main/resources/application.yaml:
+- Driver: org.postgresql.Driver
+- URL: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/releasepilot}
+- JPA Hibernate ddl-auto: validate (schema generation is handled strictly by Flyway).
+
+Entity Relationship Diagram (ERD) Overview:
+
+User (1) ───< OrganizationMember >─── (N) Organization (1)
+                                            │
+                                            └─── (N) Project (1)
+                                                       │
+                                   ┌───────────────────┴───────────────────┐
+                                   ▼                                       ▼
+                            Environment (N)                         FeatureFlag (N)
+                                   │                                       │
+                                   └───────────────┬───────────────────────┘
+                                                   ▼
+                                          FlagEnvironment (N)
+                                                   │
+                                   ┌───────────────┴───────────────┐
+                                   ▼                               ▼
+                          TargetingRule (N)                 RolloutRule (1)
+
+Detailed Entity Analysis:
+
+1. User
+   FILE: src/main/java/com/releasepilot/user/User.java
+   TABLE: users
+   FIELDS: id (UUID PK), email (VARCHAR, UNIQUE), name (VARCHAR), passwordHash (VARCHAR), createdAt, updatedAt.
+   RELATIONSHIPS: @OneToMany members in OrganizationMember.
+
+2. Organization
+   FILE: src/main/java/com/releasepilot/organization/Organization.java
+   TABLE: organizations
+   FIELDS: id (UUID PK), name (VARCHAR), slug (VARCHAR, UNIQUE), createdAt, updatedAt.
+   RELATIONSHIPS: @OneToMany members, @OneToMany projects.
+
+3. Project
+   FILE: src/main/java/com/releasepilot/project/Project.java
+   TABLE: projects
+   FIELDS: id (UUID PK), organization_id (UUID FK), name (VARCHAR), key (VARCHAR), description (TEXT), createdAt, updatedAt.
+   RELATIONSHIPS: @ManyToOne Organization, @OneToMany environments.
+
+4. Environment
+   FILE: src/main/java/com/releasepilot/project/Environment.java
+   TABLE: environments
+   FIELDS: id (UUID PK), project_id (UUID FK), name (VARCHAR), key (VARCHAR), apiKey (VARCHAR, UNIQUE), createdAt, updatedAt.
+   RELATIONSHIPS: @ManyToOne Project.
+
+5. FeatureFlag
+   FILE: src/main/java/com/releasepilot/feature/FeatureFlag.java
+   TABLE: feature_flags
+   FIELDS: id (UUID PK), project_id (UUID FK), key (VARCHAR), name (VARCHAR), description (TEXT), flagType (Enum: BOOLEAN, STRING, NUMERIC, JSON), enabled (BOOLEAN), defaultServeValue (VARCHAR), createdAt, updatedAt.
+   RELATIONSHIPS: @ManyToOne Project, @OneToMany flagEnvironments.
+
+6. FlagEnvironment
+   FILE: src/main/java/com/releasepilot/feature/FlagEnvironment.java
+   TABLE: flag_environments
+   FIELDS: id (UUID PK), flag_id (UUID FK), environment_id (UUID FK), enabled (BOOLEAN), serveValue (VARCHAR), createdAt, updatedAt.
+   RELATIONSHIPS: @ManyToOne FeatureFlag, @ManyToOne Environment, @OneToMany targetingRules, @OneToOne rolloutRule.
+
+7. TargetingRule
+   FILE: src/main/java/com/releasepilot/feature/TargetingRule.java
+   TABLE: targeting_rules
+   FIELDS: id (UUID PK), flag_environment_id (UUID FK), attribute (VARCHAR), operator (Enum: EQUALS, NOT_EQUALS, CONTAINS, IN, NOT_IN, STARTS_WITH, ENDS_WITH), valuesJson (TEXT), serveValue (VARCHAR), priority (INT), createdAt, updatedAt.
+
+8. RolloutRule
+   FILE: src/main/java/com/releasepilot/feature/RolloutRule.java
+   TABLE: rollout_rules
+   FIELDS: id (UUID PK), flag_environment_id (UUID FK, UNIQUE), attribute (VARCHAR), percentage (INT), serveValueA (VARCHAR), serveValueB (VARCHAR), createdAt, updatedAt.
+
+9. AuditLog
+   FILE: src/main/java/com/releasepilot/audit/AuditLog.java
+   TABLE: audit_logs
+   FIELDS: id (UUID PK), organization_id (UUID FK), actor_user_id (UUID), action (VARCHAR), entity_type (VARCHAR), entity_id (UUID), details_json (TEXT), timestamp.
+
+10. EvaluationLog
+   FILE: src/main/java/com/releasepilot/audit/EvaluationLog.java
+   TABLE: evaluation_logs
+   FIELDS: id (UUID PK), environment_id (UUID FK), flag_key (VARCHAR), user_context_id (VARCHAR), user_context_json (TEXT), result_value (VARCHAR), reason (VARCHAR), evaluated_at.
+
+JPA to SQL Execution Flow Example:
+Java: targetingRuleRepository.findByFlagEnvironmentIdOrderByPriorityAsc(flagEnvId)
+JPA/Hibernate translation:
+SELECT t1_0.id, t1_0.attribute, t1_0.flag_environment_id, t1_0.operator, t1_0.priority, t1_0.serve_value, t1_0.values_json 
+FROM targeting_rules t1_0 
+WHERE t1_0.flag_environment_id = ? 
+ORDER BY t1_0.priority ASC;
+
+
+==================================================
+5. FLYWAY MIGRATIONS
+==================================================
+
+Configuration:
+Location: src/main/resources/db/migration
+Spring Boot automatically detects Flyway and executes pending migrations in alphabetical order of version prefixes at startup before JPA initializes.
+
+Migration Files Breakdown:
+
+1. V1__create_identity_schema.sql
+   - Creates users table (id, email, name, created_at, updated_at).
+   - Creates organizations table (id, name, slug, created_at, updated_at).
+   - Creates organization_members table (id, organization_id, user_id, role, joined_at) with composite UNIQUE(organization_id, user_id).
+
+2. V2__add_password_to_users_and_create_projects.sql
+   - Alters users table adding password_hash VARCHAR(255).
+   - Creates projects table (id, organization_id, name, key, description, created_at, updated_at) with UNIQUE(organization_id, key).
+   - Creates environments table (id, project_id, name, key, api_key, created_at, updated_at) with UNIQUE(project_id, key) and UNIQUE(api_key).
+
+3. V3__create_feature_flags_and_rules.sql
+   - Creates feature_flags table with UNIQUE(project_id, key).
+   - Creates flag_environments table with UNIQUE(flag_id, environment_id).
+   - Creates targeting_rules table.
+   - Creates rollout_rules table with UNIQUE(flag_environment_id).
+
+4. V4__create_audit_and_eval_logs.sql
+   - Creates audit_logs table.
+   - Creates evaluation_logs table.
+
+Flyway vs JPA Relationship:
+Flyway owns DDL (table structures, constraints, indexes). Hibernate's ddl-auto is set to `validate`, verifying that JPA entity annotations match the Flyway database schema exactly.
+
+
+==================================================
+6. JWT + SPRING SECURITY
+==================================================
+
+Authentication Architecture & Flow:
+
+1. Registration (POST /api/v1/auth/register)
+   FILE: src/main/java/com/releasepilot/auth/AuthService.java
+   METHOD: register(RegisterRequest request)
+   WHAT HAPPENS: Checks if user email exists. Encrypts password using BCryptPasswordEncoder. Saves User entity. Auto-provisions default Organization and starter Project with 'dev', 'staging', 'prod' Environments. Returns JWT token.
+
+2. Login (POST /api/v1/auth/login)
+   FILE: src/main/java/com/releasepilot/auth/AuthService.java
+   METHOD: login(AuthRequest request)
+   WHAT HAPPENS: Calls authenticationManager.authenticate(new UsernamePasswordAuthenticationToken(email, password)). If valid, invokes jwtTokenProvider.generateToken(authentication) and returns AuthResponse containing JWT string.
+
+3. Password Hashing
+   FILE: src/main/java/com/releasepilot/security/PasswordEncoderConfig.java
+   BEAN: PasswordEncoder passwordEncoder() -> returns new BCryptPasswordEncoder().
+
+4. User Lookup
+   FILE: src/main/java/com/releasepilot/security/CustomUserDetailsService.java
+   METHODS: loadUserByUsername(String email), loadUserById(UUID id)
+   WHAT HAPPENS: Queries UserRepository and wraps returned User entity in UserPrincipal (implements Spring Security UserDetails).
+
+5. JWT Creation & Claims
+   FILE: src/main/java/com/releasepilot/security/JwtTokenProvider.java
+   METHOD: generateTokenFromUserId(UUID userId, String email)
+   WHAT HAPPENS:
+   - Subject: userId.toString()
+   - Claim "email": email
+   - IssuedAt: current date
+   - Expiration: current date + 86400000 ms (24 hours)
+   - Signature: HMAC-SHA256 using key derived from jwt.secret property.
+
+6. JWT Validation & Security Filter
+   FILE: src/main/java/com/releasepilot/security/JwtAuthenticationFilter.java
+   METHOD: doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain)
+   WHAT HAPPENS:
+   a. Extracts "Authorization: Bearer <token>" header via getJwtFromRequest().
+   b. Calls tokenProvider.validateToken(jwt).
+   c. Parses userId via tokenProvider.getUserIdFromJWT(jwt).
+   d. Loads UserDetails via customUserDetailsService.loadUserById(userId).
+   e. Instantiates UsernamePasswordAuthenticationToken and sets it in SecurityContextHolder.getContext().setAuthentication(...).
+
+7. Protected vs Permitted Endpoints
+   FILE: src/main/java/com/releasepilot/security/SecurityConfig.java
+   METHOD: filterChain(HttpSecurity http)
+   Permitted: /api/v1/auth/**, /api/v1/eval/**, /actuator/health, /swagger-ui/**.
+   Protected: All other routes (/api/v1/projects/**, /api/v1/flags/**, etc.) require valid JWT Bearer header.
+
+Exact Code Path to Show Interviewer for "How Authentication Works":
+1. SecurityConfig.java -> filterChain() (Show endpoint permission rules & filter registration)
+2. JwtAuthenticationFilter.java -> doFilterInternal() (Show header extraction & SecurityContext population)
+3. JwtTokenProvider.java -> validateToken() & getUserIdFromJWT() (Show JJWT parsing & HMAC verification)
+
+
+==================================================
+7. REDIS CACHING
+==================================================
+
+Actual Redis Implementation Analysis:
+
+1. Configuration & Enablement:
+   FILE: src/main/java/com/releasepilot/config/RedisCacheConfig.java
+   CLASS: RedisCacheConfig
+   - Annotated with @Configuration, @EnableCaching, and @ConditionalOnProperty(name = "releasepilot.cache.enabled", havingValue = "true").
+   - If releasepilot.cache.enabled is false (default in application.yaml), RedisCacheConfig is NOT loaded into Spring context.
+
+2. Cache Manager & Serializer:
+   BEAN: RedisCacheManager cacheManager(RedisConnectionFactory connectionFactory, ReleasePilotProperties properties)
+   - TTL: Configured dynamically via releasepilot.cache.ttl-seconds (default: 30 seconds).
+   - Serializer: GenericJackson2JsonRedisSerializer (serializes DTO objects to JSON strings in Redis).
+
+3. Data Cached:
+   Cache Name: "evaluations"
+   Cached Object: EvaluationResultDto (contains flagKey, value, reason, environmentKey).
+
+4. Key Structure:
+   FILE: src/main/java/com/releasepilot/feature/EvaluationService.java
+   METHOD: buildCacheKey(UUID environmentId, String flagKey, Map<String, Object> context)
+   Structure: SHA-256 Hex Digest of string: environmentId + ":" + flagKey + ":" + objectMapper.writeValueAsString(new TreeMap<>(context))
+   Example Key: "a3f8b912c4..." (64-character SHA-256 hex string).
+
+5. Read / Write / Fallback Logic:
+   FILE: src/main/java/com/releasepilot/feature/EvaluationService.java
+   METHODS: getCachedResult(cacheKey), putCachedResult(cacheKey, result)
+   - Cache Manager Injection: @Autowired(required = false) private CacheManager cacheManager;
+   - If Redis is disabled (cacheManager is null) or Redis is unreachable, getCachedResult returns null (Cache Miss fallback).
+   - If enabled:
+     Cache Hit: Returns cached EvaluationResultDto directly, bypassing database rules evaluation.
+     Cache Miss: Performs DB rules evaluation, calls putCachedResult(cacheKey, result) to store entry in Redis with TTL.
+
+Redis Invalidation:
+NOT IMPLEMENTED
+Note: Cache entries automatically expire via TTL (30s). Manual cache eviction on flag update (e.g. @CacheEvict) is NOT implemented.
+
+
+==================================================
+8. FEATURE FLAGS (CORE BUSINESS LOGIC)
+==================================================
+
+Feature Flag Lifecycle & Evaluation Pipeline:
+
+1. Creation
+   FILE: src/main/java/com/releasepilot/feature/FeatureFlagService.java
+   METHOD: createFlag(UUID projectId, CreateFeatureFlagRequest request)
+   - Saves FeatureFlag entity in `feature_flags` table.
+   - Automatically iterates over all Environments in the Project and creates a corresponding `FlagEnvironment` entity for each environment (defaulting enabled = true).
+
+2. Evaluation Pipeline (Tracing evaluateFlag in EvaluationService.java)
+   FILE: src/main/java/com/releasepilot/feature/EvaluationService.java
+   METHOD: performEvaluation(FeatureFlag flag, Environment environment, Map<String, Object> context)
+
+   Step 1: Global Flag Enabled Check
+   If flag.getEnabled() is false -> returns defaultServeValue with reason FLAG_DISABLED.
+
+   Step 2: Environment Flag Check
+   Look up FlagEnvironment by (flagId, environmentId). If missing or flagEnv.getEnabled() is false -> returns defaultServeValue with reason ENVIRONMENT_DISABLED.
+
+   Step 3: Targeting Rules Check
+   Fetches targeting rules ordered by priority ASC: targetingRuleRepository.findByFlagEnvironmentIdOrderByPriorityAsc(flagEnv.getId()).
+   Iterates through rules. Evaluates evaluateTargetingRule(rule, context).
+   If matched -> returns rule.getServeValue() with reason TARGET_MATCH.
+
+   Step 4: Percentage Rollout Check
+   Fetches RolloutRule for flagEnv.
+   If present -> calculates bucket integer via HashUtils.getBucket(flag.getKey() + ":" + attrValue).
+   If bucket < rollout.getPercentage() -> returns serveValueA; else -> serveValueB with reason PERCENTAGE_ROLLOUT.
+
+   Step 5: Default Fallback
+   Returns flagEnv.getServeValue() (or flag.getDefaultServeValue()) with reason DEFAULT_VALUE.
+
+
+==================================================
+9. PROGRESSIVE ROLLOUT (DETERMINISTIC CONSISTENT HASHING)
+==================================================
+
+Determining How Percentage Rollout Works:
+ReleasePilot does NOT use random numbers, TreeMap, or database counter tables for percentage rollouts.
+It uses Deterministic SHA-256 Hashing over user context attributes.
+
+Tracing the Code:
+
+FILE: src/main/java/com/releasepilot/feature/EvaluationService.java
+METHOD: performEvaluation(...) [Lines 119-131]
+
+```java
+Optional<RolloutRule> rolloutOpt = rolloutRuleRepository.findByFlagEnvironmentId(flagEnv.getId());
+if (rolloutOpt.isPresent()) {
+    RolloutRule rollout = rolloutOpt.get();
+    String attrKey = rollout.getAttribute() != null ? rollout.getAttribute() : "userId";
+    String attrValue = context.containsKey(attrKey) ? String.valueOf(context.get(attrKey)) : UUID.randomUUID().toString();
+
+    int bucket = HashUtils.getBucket(flag.getKey() + ":" + attrValue);
+    if (bucket < rollout.getPercentage()) {
+        return buildResult(flag, rollout.getServeValueA(), EvaluationReason.PERCENTAGE_ROLLOUT, environment.getKey());
+    } else {
+        return buildResult(flag, rollout.getServeValueB(), EvaluationReason.PERCENTAGE_ROLLOUT, environment.getKey());
+    }
+}
+```
+
+FILE: src/main/java/com/releasepilot/common/HashUtils.java
+CLASS: HashUtils
+METHOD: getBucket(String input)
+
+```java
+public static int getBucket(String input) {
+    try {
+        MessageDigest md = MessageDigest.getInstance("SHA-256");
+        byte[] digest = md.digest(input.getBytes(StandardCharsets.UTF_8));
+        
+        // Take first 4 bytes to form a 32-bit integer via bitwise shifts
+        int hash = ((digest[0] & 0xFF) << 24) |
+                   ((digest[1] & 0xFF) << 16) |
+                   ((digest[2] & 0xFF) << 8)  |
+                   (digest[3] & 0xFF);
+
+        return Math.abs(hash % 100);
+    } catch (Exception e) {
+        return Math.abs(input.hashCode() % 100);
+    }
+}
+```
+
+How it Works mathematically:
+1. Input string: `"new-checkout:usr_9981"`
+2. SHA-256 Digest: Produces 32 deterministic bytes.
+3. Bitwise shifting converts 4 bytes to 32-bit integer: `((b0 & 0xFF) << 24) | ...`
+4. Modulo 100: `Math.abs(hash % 100)` yields an integer in `[0, 99]`.
+5. Evaluation: If percentage is 30% (i.e. bucket 0..29), users with bucket < 30 receive serveValueA.
+6. Guaranteed Properties: Statistically uniform distribution across 100 buckets, 100% deterministic (same user always gets same result), stateless execution.
+
+
+==================================================
+10. TREEMAP USAGE & THEORY
+==================================================
+
+Actual Code Usage:
+
+FILE: src/main/java/com/releasepilot/feature/EvaluationService.java
+CLASS: EvaluationService
+METHOD: buildCacheKey(UUID environmentId, String flagKey, Map<String, Object> context)
+LINE: 230
+CODE: `String payload = environmentId + ":" + flagKey + ":" + objectMapper.writeValueAsString(new TreeMap<>(context));`
+
+What is Stored:
+- KEY: String (context attribute names, e.g. "country", "email", "userId").
+- VALUE: Object (attribute values).
+
+Why TreeMap is Used Here:
+To achieve **Map Key Normalization (Canonicalization)** before generating the Redis cache key hash.
+Standard HashMap iteration order is non-deterministic. If two requests pass identical context keys in different insertion orders:
+Request A: `{"userId":"1", "country":"US"}`
+Request B: `{"country":"US", "userId":"1"}`
+A standard HashMap serialized to JSON might produce different strings, generating different SHA-256 hashes (Cache Miss).
+Wrapping the context in `new TreeMap<>(context)` sorts the keys lexicographically ("country" before "userId"). Serialization yields identical JSON string payloads, guaranteeing cache key identity!
+
+TreeMap Computer Science Fundamentals:
+- Map: Key-value pair associative container.
+- TreeMap Implementation: Red-Black Tree (self-balancing binary search tree).
+- Time Complexity: O(log N) for insertion, lookup, and deletion (where N is number of keys in map).
+- Ordering: Sorted according to natural key ordering (Comparable) or explicit Comparator.
+- Comparison (TreeMap vs HashMap):
+  - HashMap: O(1) average lookup/insert, backed by hash table array + linked lists/Red-Black trees (for bucket collisions), UNORDERED.
+  - TreeMap: O(log N) lookup/insert, backed strictly by Red-Black Tree, ALWAYS SORTED by key.
+
+Does TreeMap Have Anything To Do With Handling Millions of Users?
+NO. In ReleasePilot, TreeMap is used locally per request on small context maps (typically 1 to 5 elements) purely to sort JSON keys for cache key hashing. It is NOT used as an in-memory database or user storage.
+
+
+==================================================
+11. ERROR HANDLING
+==================================================
+
+Architecture:
+Global exception interception using `@RestControllerAdvice`. All exceptions are mapped to standard HTTP response wrapper `ApiResponse<T>`.
+
+FILE: src/main/java/com/releasepilot/common/GlobalExceptionHandler.java
+
+Exceptions & HTTP Status Mapping:
+1. ResourceNotFoundException -> HTTP 404 NOT FOUND (`ApiResponse.error(message)`)
+2. BadRequestException -> HTTP 400 BAD REQUEST (`ApiResponse.error(message)`)
+3. UnauthorizedException -> HTTP 401 UNAUTHORIZED (`ApiResponse.error(message)`)
+4. DuplicateResourceException -> HTTP 409 CONFLICT (`ApiResponse.error(message)`)
+5. MethodArgumentNotValidException -> HTTP 400 BAD REQUEST (`ApiResponse` with map of field error messages)
+6. Uncaught Exception -> HTTP 500 INTERNAL SERVER ERROR (`ApiResponse.error("An unexpected error occurred: ...")`)
+
+
+==================================================
+12. TRANSACTIONS & CONCURRENCY
+==================================================
+
+What Current Code Does:
+1. @Transactional Annotation: Applied on Service methods (e.g. AuthService.register, FeatureFlagService.createFlag, EvaluationService.evaluateFlag).
+2. Database Constraints: Relies on PostgreSQL unique indexes (`UNIQUE(organization_id, key)`, `UNIQUE(api_key)`, `UNIQUE(flag_id, environment_id)`) to reject duplicate entries under concurrent requests.
+3. Exception Conversion: Unique constraint violations throw DataIntegrityViolationException at DB level.
+
+What Could Be Improved (Gaps / Weaknesses):
+1. Optimistic Locking: Entities lack `@Version` fields. Concurrent updates to flag rules will execute last-write-wins (lost update anomaly).
+2. Pessimistic Locking: No `SELECT FOR UPDATE` queries used during rule updates.
+3. Race Conditions on Auto-Provisioning: If two requests register with same organization name simultaneously, duplicate org check in AuthService might suffer read-then-write race condition if DB constraints fail.
+
+
+==================================================
+13. DOCKER & INFRASTRUCTURE
+==================================================
+
+Docker Setup Files:
+1. Dockerfile (Root directory): Multi-stage build.
+   - Stage 1: `maven:3.9-eclipse-temurin-21` compiles project (`mvn package -DskipTests`).
+   - Stage 2: `eclipse-temurin:21-jre-alpine` copies `target/*.jar` to `app.jar` and runs `ENTRYPOINT ["java", "-jar", "/app.jar"]`.
+
+2. docker-compose.yaml: Orchestrates 3 services:
+   - `postgres`: Container releasepilot-postgres (Image: postgres:17, Port 5432:5432, Healthcheck: pg_isready).
+   - `redis`: Container releasepilot-redis (Image: redis:7-alpine, Port 6379:6379, Healthcheck: redis-cli ping).
+   - `app`: Container releasepilot-app (Builds Dockerfile, Port 8080:8080, Environment variables point to postgres:5432 and redis:6379, depends_on postgres & redis with `condition: service_healthy`).
+
+What Happens On `docker compose up`:
+1. Postgres and Redis containers start and run health check scripts until healthy.
+2. App container starts, connects to Postgres via JDBC `jdbc:postgresql://postgres:5432/releasepilot`.
+3. Flyway runs SQL migrations V1->V4 inside app container.
+4. Spring Boot app starts on port 8080 ready to receive HTTP requests.
+
+
+==================================================
+14. BACKEND SCALABILITY
+==================================================
+
+Currently Implemented:
+1. Stateless Architecture: Backend app stores no HTTP session state (JWT & API Key headers). App nodes can scale horizontally behind a Load Balancer.
+2. High-Performance Evaluation Caching: Opt-in Redis caching absorbs read traffic for flag evaluations.
+3. Database Indexing: Foreign keys and unique constraints in Flyway migrations create DB indexes on high-frequency query columns (`api_key`, `project_id`, `key`).
+
+Possible Future Improvements (Not Yet Implemented):
+1. Cache Invalidation: Implement Redis pub/sub or `@CacheEvict` when flag rules are edited instead of relying solely on 30s TTL.
+2. Read Replicas: Separate DB read-write connections using Spring `@Transactional(readOnly = true)` routing to PostgreSQL read replicas.
+3. Distributed Rate Limiting: Add Redis token bucket filter to prevent SDK API key abuse.
+
+
+==================================================
+15. MOST IMPORTANT BACKEND REQUEST FLOWS
+==================================================
+
+Flow 1: User Registration
+REQUEST: POST /api/v1/auth/register
+ENDPOINT: AuthController.register()
+SERVICE: AuthService.register()
+REPOSITORY: UserRepository.save(), OrganizationRepository.save(), ProjectRepository.save(), EnvironmentRepository.save()
+DATABASE: Inserts into users, organizations, organization_members, projects, environments.
+REDIS: None.
+RESPONSE: 200 OK -> ApiResponse<AuthResponse> containing JWT token.
+
+Flow 2: Flag Evaluation (SDK)
+REQUEST: POST /api/v1/eval/evaluate Header: X-API-Key
+ENDPOINT: EvaluationController.evaluateFlag()
+SERVICE: EvaluationService.evaluateFlag()
+REPOSITORY: EnvironmentRepository.findByApiKey(), FeatureFlagRepository.findByProjectIdAndKey(), TargetingRuleRepository, RolloutRuleRepository, EvaluationLogRepository.save()
+DATABASE: SELECT on environments, feature_flags, targeting_rules, rollout_rules; INSERT into evaluation_logs.
+REDIS: Checked via CacheManager.get("evaluations").get(cacheKey). If hit, DB reads are skipped.
+RESPONSE: 200 OK -> ApiResponse<EvaluationResultDto>.
+
+
+==================================================
+16. INTERVIEW QUESTIONS & ANSWERS
+==================================================
+
+--- 20 BASIC QUESTIONS ---
+
+Q1: What is the main purpose of ReleasePilot?
+A: It is a feature flag and progressive rollout platform backend that allows developers to dynamically control feature releases and user targeting via REST APIs without redeploying code.
+FILE: README.md
+
+Q2: Which Java and Spring Boot versions are used?
+A: Java 21 and Spring Boot 4.1.0.
+FILE: pom.xml
+
+Q3: How are database migrations managed?
+A: Using Flyway SQL migration scripts located in src/main/resources/db/migration (V1 to V4).
+FILE: src/main/resources/db/migration/V1__create_identity_schema.sql
+
+Q4: What authentication mechanism is used for Admin APIs?
+A: Stateless JWT (JSON Web Token) sent via Authorization Bearer header.
+FILE: src/main/java/com/releasepilot/security/JwtAuthenticationFilter.java
+
+Q5: How do external SDK applications authenticate with ReleasePilot?
+A: Using per-environment API keys passed in the `X-API-Key` HTTP header.
+FILE: src/main/java/com/releasepilot/feature/EvaluationController.java
+
+Q6: What database is used in production/docker?
+A: PostgreSQL 17.
+FILE: docker-compose.yaml
+
+Q7: What caching provider is used?
+A: Redis 7 configured via Spring Data Redis & Spring Cache.
+FILE: src/main/java/com/releasepilot/config/RedisCacheConfig.java
+
+Q8: How is password security handled?
+A: Passwords are hashed using BCryptPasswordEncoder before storing in DB.
+FILE: src/main/java/com/releasepilot/security/PasswordEncoderConfig.java
+
+Q9: What flag data types are supported?
+A: BOOLEAN, STRING, NUMERIC, and JSON.
+FILE: src/main/java/com/releasepilot/feature/FlagType.java
+
+Q10: What component handles uncaught backend exceptions?
+A: GlobalExceptionHandler annotated with @RestControllerAdvice.
+FILE: src/main/java/com/releasepilot/common/GlobalExceptionHandler.java
+
+Q11: How is multi-tenancy structured?
+A: Users belong to Organizations, which contain Projects, which contain Environments and Feature Flags.
+FILE: src/main/java/com/releasepilot/organization/Organization.java
+
+Q12: What environments are auto-created when a Project is created?
+A: 'dev', 'staging', and 'prod'.
+FILE: src/main/java/com/releasepilot/project/ProjectService.java -> createProject()
+
+Q13: Where is Swagger OpenAPI documentation hosted?
+A: At /swagger-ui.html generated by springdoc-openapi.
+FILE: src/main/java/com/releasepilot/config/OpenApiConfig.java
+
+Q14: How are targeting rule priorities ordered?
+A: Ascending numerical priority (Priority 1 executes before Priority 2).
+FILE: src/main/java/com/releasepilot/feature/TargetingRuleRepository.java
+
+Q15: What algorithm is used for percentage rollouts?
+A: SHA-256 consistent hashing mapped into 100 integer buckets (0 to 99).
+FILE: src/main/java/com/releasepilot/common/HashUtils.java
+
+Q16: How does ReleasePilot generate AI insights?
+A: OpenAiInsightClient uses Java's native HttpClient to send rollout stats to OpenAI's /chat/completions endpoint.
+FILE: src/main/java/com/releasepilot/audit/OpenAiInsightClient.java
+
+Q17: Is Redis caching mandatory for running ReleasePilot?
+A: No, it is conditional on `releasepilot.cache.enabled=true`. If false or down, evaluation falls back directly to PostgreSQL.
+FILE: src/main/java/com/releasepilot/config/RedisCacheConfig.java
+
+Q18: How are audit logs written?
+A: Via AuditLogWriter helper service whenever flag/project mutations occur.
+FILE: src/main/java/com/releasepilot/audit/AuditLogWriter.java
+
+Q19: What primary keys are used across entities?
+A: UUID (Universally Unique Identifier) generated via @GeneratedValue(strategy = GenerationType.UUID).
+FILE: src/main/java/com/releasepilot/feature/FeatureFlag.java
+
+Q20: How is Docker health check performed for Postgres in Docker Compose?
+A: Executing `pg_isready -U releasepilot -d releasepilot`.
+FILE: docker-compose.yaml
+
+
+--- 15 MEDIUM-DEPTH QUESTIONS ---
+
+Q1: Trace how JwtAuthenticationFilter processes an incoming request.
+DETAILED ANSWER: It extracts the `Authorization` header, strips the `Bearer ` prefix, validates token signature using JwtTokenProvider (HMAC-SHA256 key), extracts the `userId` claim, loads UserDetails via CustomUserDetailsService, and sets a UsernamePasswordAuthenticationToken in SecurityContextHolder.
+FILE: src/main/java/com/releasepilot/security/JwtAuthenticationFilter.java
+
+Q2: How does EvaluationService construct cache keys for Redis?
+DETAILED ANSWER: It concatenates `environmentId + ":" + flagKey + ":"` and serializes context wrapped in a `TreeMap` to JSON. It then computes a 64-char SHA-256 hex digest of this string.
+FILE: src/main/java/com/releasepilot/feature/EvaluationService.java -> buildCacheKey()
+
+Q3: Why is TreeMap used when generating the cache key?
+DETAILED ANSWER: TreeMap sorts context map keys alphabetically. This ensures identical context parameters passed in different key orders produce the exact same JSON string and SHA-256 hash.
+FILE: src/main/java/com/releasepilot/feature/EvaluationService.java -> line 230
+
+Q4: Explain the 5-step evaluation rule hierarchy in performEvaluation().
+DETAILED ANSWER: 1. Flag globally enabled check -> 2. Environment flag enabled check -> 3. Priority-ordered targeting rules check -> 4. Percentage rollout bucketing check -> 5. Environment/Flag default value fallback.
+FILE: src/main/java/com/releasepilot/feature/EvaluationService.java -> performEvaluation()
+
+Q5: How does HashUtils.getBucket() map a user to a 0-99 bucket?
+DETAILED ANSWER: It hashes `input` using SHA-256, combines the first 4 bytes using bitwise operations (`<< 24 | << 16 | << 8 | b3`) into a 32-bit integer, and returns `Math.abs(hash % 100)`.
+FILE: src/main/java/com/releasepilot/common/HashUtils.java -> getBucket()
+
+Q6: What happens if OpenAI API returns an HTTP 500 error during insight generation?
+DETAILED ANSWER: OpenAiInsightClient catches non-200 responses, logs a warning, and returns null. InsightService falls back to a rule-based summary string without throwing an exception.
+FILE: src/main/java/com/releasepilot/audit/OpenAiInsightClient.java -> lines 71-80
+
+Q7: How is multi-tenancy enforced between Organizations?
+DETAILED ANSWER: Projects belong to Organizations via `organization_id` FK. Database unique constraints (`UNIQUE(organization_id, key)`) prevent key collisions across organizations while keeping tenant data isolated.
+FILE: src/main/resources/db/migration/V2__add_password_to_users_and_create_projects.sql
+
+Q8: What JPA cascade and fetch types are used on FeatureFlag -> FlagEnvironment?
+DETAILED ANSWER: CascadeType.ALL and FetchType.LAZY.
+FILE: src/main/java/com/releasepilot/feature/FeatureFlag.java
+
+Q9: How are targeting rule operators (CONTAINS, IN, STARTS_WITH) evaluated?
+DETAILED ANSWER: The JSON string array in `valuesJson` is parsed using ObjectMapper into `List<String>`. Stream operations check matching conditions against the string value of the context attribute.
+FILE: src/main/java/com/releasepilot/feature/EvaluationService.java -> evaluateTargetingRule()
+
+Q10: What happens if an SDK evaluation request does not supply a userId in context during percentage rollout?
+DETAILED ANSWER: EvaluationService generates a fallback random `UUID.randomUUID().toString()`, ensuring request completion without throwing NullPointerException.
+FILE: src/main/java/com/releasepilot/feature/EvaluationService.java -> line 123
+
+Q11: How does GlobalExceptionHandler handle DTO validation errors?
+DETAILED ANSWER: It catches `MethodArgumentNotValidException`, extracts field errors into a `Map<String, String>`, and returns HTTP 400 Bad Request with `ApiResponse`.
+FILE: src/main/java/com/releasepilot/common/GlobalExceptionHandler.java -> handleValidationExceptions()
+
+Q12: How are API keys generated when a new Environment is created?
+DETAILED ANSWER: Generates UUID string with prefix: `key = prefix + "_" + UUID.randomUUID().toString().replace("-", "")`.
+FILE: src/main/java/com/releasepilot/project/ProjectService.java -> generateApiKey()
+
+Q13: How does Flyway interact with Hibernate on startup?
+DETAILED ANSWER: Flyway runs first executing SQL files V1-V4. Then Hibernate validates JPA annotations against the schema because `spring.jpa.hibernate.ddl-auto=validate`.
+FILE: src/main/resources/application.yaml
+
+Q14: How is evaluation activity logged?
+DETAILED ANSWER: After flag evaluation completes, an `EvaluationLog` entity is created and saved via `evaluationLogRepository.save(log)` wrapped in a try-catch block.
+FILE: src/main/java/com/releasepilot/feature/EvaluationService.java -> lines 60-76
+
+Q15: What HTTP security configuration is set for CORS?
+DETAILED ANSWER: Allowed origin patterns `*`, allowed methods (`GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `OPTIONS`), allowed headers `*`, credentials allowed.
+FILE: src/main/java/com/releasepilot/security/SecurityConfig.java -> corsConfigurationSource()
+
+
+--- 10 VERY DEEP QUESTIONS ---
+
+Q1: Why bitwise shifting `((digest[0] & 0xFF) << 24) | ...` in HashUtils instead of String hashCode()?
+DETAILED ANSWER: Java's `String.hashCode()` uses a simple polynomial hash ($s[0]*31^{n-1} + ...$) which suffers from high collision rates and non-uniform distribution across small ranges. Bitwise shifting the first 4 bytes of a SHA-256 cryptographic digest guarantees uniform mathematical entropy across [0, 99].
+FILE: src/main/java/com/releasepilot/common/HashUtils.java
+LIMITATION: SHA-256 calculation overhead is higher than hashCode().
+IMPROVEMENT: MurmurHash3 could be used for faster non-cryptographic hashing.
+
+Q2: Is the Redis cache invalidation currently consistent when flag rules are updated?
+DETAILED ANSWER: NO. When an admin updates a targeting rule or flag state in FeatureFlagService, `@CacheEvict` is NOT called. Cache entries persist in Redis until their 30-second TTL expires.
+FILE: src/main/java/com/releasepilot/feature/FeatureFlagService.java
+LIMITATION: Stale flag evaluation results can be served up to 30s after rule changes.
+POSSIBLE IMPROVEMENT: Add `@CacheEvict(value = "evaluations", allEntries = true)` or Redis Pub/Sub invalidation upon flag update.
+
+Q3: What database concurrency issues exist in AuthService.register()?
+DETAILED ANSWER: `register()` performs a non-atomic read-then-write check (`userRepository.existsByEmail`). Under heavy concurrent registration requests with the same email, two threads could pass `existsByEmail` simultaneously.
+FILE: src/main/java/com/releasepilot/auth/AuthService.java
+WHY: Relies on PostgreSQL unique constraint on `users(email)` to abort the second transaction with `DataIntegrityViolationException`.
+IMPROVEMENT: Catch DataIntegrityViolationException in GlobalExceptionHandler and rethrow DuplicateResourceException.
+
+Q4: Explain how Spring's @Transactional behaves during evaluationLogRepository.save() in EvaluationService.
+DETAILED ANSWER: Because `evaluateFlag` is annotated with `@Transactional`, if `evaluationLogRepository.save(log)` fails due to a DB exception, the entire transaction (including any pending entity state changes) will roll back despite the try-catch block!
+FILE: src/main/java/com/releasepilot/feature/EvaluationService.java
+LIMITATION: Log insertion failure can break flag evaluation API response.
+POSSIBLE IMPROVEMENT: Move evaluation logging to an asynchronous event listener (`@Async` or `@Transactional(propagation = Propagation.REQUIRES_NEW)`).
+
+Q5: How does Jackson deserialize complex JSON flag types in parseTypedValue()?
+DETAILED ANSWER: When `flagType == FlagType.JSON`, `objectMapper.readValue(rawValue, Object.class)` parses raw JSON string into a Java Map or List, which is returned inside `EvaluationResultDto.value`.
+FILE: src/main/java/com/releasepilot/feature/EvaluationService.java -> parseTypedValue()
+
+Q6: Why is `CustomUserDetailsService.loadUserById()` implemented in addition to `loadUserByUsername()`?
+DETAILED ANSWER: JWT tokens store the user's UUID as the subject claim (not email). Storing immutable UUIDs in JWT claims prevents authentication breakdown if a user changes their email address.
+FILE: src/main/java/com/releasepilot/security/CustomUserDetailsService.java
+
+Q7: What happens if Redis goes down while `releasepilot.cache.enabled=true`?
+DETAILED ANSWER: `getCachedResult()` and `putCachedResult()` check `if (cacheManager == null)`. However, if Redis connection drops, Spring Cache throws a `QueryTimeoutException` or `RedisConnectionFailureException`.
+FILE: src/main/java/com/releasepilot/feature/EvaluationService.java
+LIMITATION: Backend requests fail if Redis crashes.
+POSSIBLE IMPROVEMENT: Implement a custom CacheErrorHandler bean returning null on Redis exceptions to fall back smoothly to PostgreSQL.
+
+Q8: How does Flyway ensure migration scripts are not tampered with after execution?
+DETAILED ANSWER: Flyway calculates a SHA-256 checksum for every `.sql` file and records it in `flyway_schema_history` table. If a previously applied migration file is edited, Flyway halts application startup with a ChecksumMismatchException.
+
+Q9: What security vulnerability exists in `SecurityConfig` CORS configuration?
+DETAILED ANSWER: `configuration.setAllowedOriginPatterns(List.of("*"))` combined with `setAllowCredentials(true)` reflects any Origin header, exposing JWT APIs to Cross-Origin Request Forgery / credential leaks if hosted publicly.
+FILE: src/main/java/com/releasepilot/security/SecurityConfig.java
+
+Q10: Why does `InsightService.assessRisk()` flag traffic as `HIGH` risk when maxShare > 0.95?
+DETAILED ANSWER: If 95%+ of traffic evaluates to a single variant during a configured 50/50 rollout, it indicates potential rule misconfiguration, sticky hashing anomalies, or zero traffic reaching new feature code.
+FILE: src/main/java/com/releasepilot/audit/InsightService.java -> assessRisk()
+
+
+==================================================
+17. "SHOW ME THE CODE" GUIDE
+==================================================
+
+1. Topic: JWT Authentication Filter
+   INTERVIEWER: "Show me where incoming JWT tokens are intercepted and validated."
+   OPEN: src/main/java/com/releasepilot/security/JwtAuthenticationFilter.java
+   SHOW: doFilterInternal() [Lines 26-47]
+   EXPLAIN: "We extract the Bearer token from HTTP header, validate signature with JwtTokenProvider, fetch user by UUID, and populate Spring's SecurityContextHolder."
+
+2. Topic: Deterministic Rollout Hashing
+   INTERVIEWER: "Show me how percentage rollout is calculated."
+   OPEN: src/main/java/com/releasepilot/common/HashUtils.java
+   SHOW: getBucket() [Lines 11-26]
+   EXPLAIN: "We pass `flagKey:userId` to SHA-256, extract first 4 bytes via bitwise shift, and modulo 100 to get a deterministic integer in range [0, 99]."
+
+3. Topic: Rule Evaluation Pipeline
+   INTERVIEWER: "Show me the core flag evaluation logic."
+   OPEN: src/main/java/com/releasepilot/feature/EvaluationService.java
+   SHOW: performEvaluation() [Lines 96-136]
+   EXPLAIN: "This method executes our 5-level pipeline: Flag Enabled -> Env Enabled -> Priority Targeting Rules -> Percentage Rollout -> Default Fallback."
+
+4. Topic: TreeMap Cache Key Normalization
+   INTERVIEWER: "Show me where TreeMap is used in the codebase."
+   OPEN: src/main/java/com/releasepilot/feature/EvaluationService.java
+   SHOW: buildCacheKey() [Line 230]
+   EXPLAIN: "We wrap context map in `new TreeMap<>(context)` before JSON serialization to sort keys alphabetically. This ensures identical contexts yield identical SHA-256 cache keys regardless of insertion order."
+
+5. Topic: Redis Cache Configuration
+   INTERVIEWER: "Show me your Redis configuration."
+   OPEN: src/main/java/com/releasepilot/config/RedisCacheConfig.java
+   SHOW: cacheManager() [Lines 20-30]
+   EXPLAIN: "We configure RedisCacheManager conditionally when `releasepilot.cache.enabled=true`, setting entry TTL and GenericJackson2JsonRedisSerializer."
+
+
+==================================================
+18. PROJECT EXPLANATION SCRIPTS
+==================================================
+
+30-Second Explanation:
+"ReleasePilot is a multi-tenant feature flag and progressive rollout backend built with Java 21 and Spring Boot 4. It enables engineering teams to turn features ON or OFF dynamically and perform percentage-based rollouts to target users via high-performance REST evaluation APIs, utilizing Redis caching, SHA-256 consistent hashing, PostgreSQL, and Flyway database migrations."
+
+2-Minute Explanation:
+"ReleasePilot is a backend platform designed to decouple software deployment from feature releases. Built on Spring Boot 4 and Java 21, it provides JWT-authenticated management APIs for Organizations, Projects, and Flags, alongside API Key-authenticated evaluation endpoints for external SDK clients. 
+When an app evaluates a flag, our EvaluationService executes a short-circuit rule engine: checking global toggles, priority-ordered targeting rules, and percentage rollouts. For percentage rollouts, we use SHA-256 bitwise hashing to map user IDs deterministically to buckets 0 through 99 without storing per-user state in the database. Evaluation results are cached in Redis using canonicalized TreeMap SHA-256 keys, while Flyway manages PostgreSQL migrations."
+
+5-Minute Technical Deep-Dive:
+(See Section 1 Architecture + Section 8 Evaluation Pipeline + Section 9 Progressive Rollout + Section 7 Redis Caching).
+
+
+==================================================
+19. WHAT YOU MUST NOT CLAIM (NOT IMPLEMENTED)
+==================================================
+
+Do NOT claim the following features exist in ReleasePilot:
+- NOT IMPLEMENTED: Distributed locking (ShedLock / Redlock).
+- NOT IMPLEMENTED: Rate limiting filters (Bucket4j / Guava RateLimiter).
+- NOT IMPLEMENTED: Real-time WebSockets / SSE flag streaming (evaluation is pull-based REST).
+- NOT IMPLEMENTED: Active cache eviction (@CacheEvict) on flag rule update (relies on 30s TTL).
+- NOT IMPLEMENTED: Role-Based Access Control (RBAC) fine-grained permissions (org member roles exist in schema but are not enforced in SecurityConfig).
+- NOT IMPLEMENTED: Kafka / RabbitMQ message queues.
+- NOT IMPLEMENTED: Kubernetes Helm charts (Docker Compose is used).
+- NOT IMPLEMENTED: Prometheus / Grafana custom metrics export (only Spring Actuator defaults exposed).
+
+
+==================================================
+20. FINAL BACKEND CHEAT SHEET
+==================================================
+
+PROJECT: ReleasePilot
+PURPOSE: Feature Flag & Progressive Rollout Platform
+JAVA VERSION: 21
+SPRING BOOT VERSION: 4.1.0
+DATABASE: PostgreSQL 17
+ORM: Spring Data JPA / Hibernate 6
+MIGRATIONS: Flyway (V1-V4)
+CACHE: Redis 7 (Spring Cache Abstraction)
+SECURITY: Spring Security (Stateless JWT + X-API-Key)
+DOCKER: Multi-stage Dockerfile + Docker Compose
+
+TOP 10 BACKEND FILES TO KNOW:
+1. src/main/java/com/releasepilot/feature/EvaluationService.java
+2. src/main/java/com/releasepilot/common/HashUtils.java
+3. src/main/java/com/releasepilot/security/SecurityConfig.java
+4. src/main/java/com/releasepilot/security/JwtAuthenticationFilter.java
+5. src/main/java/com/releasepilot/security/JwtTokenProvider.java
+6. src/main/java/com/releasepilot/feature/FeatureFlagService.java
+7. src/main/java/com/releasepilot/auth/AuthService.java
+8. src/main/java/com/releasepilot/config/RedisCacheConfig.java
+9. src/main/java/com/releasepilot/audit/OpenAiInsightClient.java
+10. src/main/java/com/releasepilot/common/GlobalExceptionHandler.java
+
+TOP 10 METHODS TO KNOW:
+1. EvaluationService.evaluateFlag()
+2. EvaluationService.performEvaluation()
+3. EvaluationService.buildCacheKey()
+4. HashUtils.getBucket()
+5. JwtAuthenticationFilter.doFilterInternal()
+6. JwtTokenProvider.generateTokenFromUserId()
+7. AuthService.register()
+8. FeatureFlagService.createFlag()
+9. OpenAiInsightClient.generateInsightSummary()
+10. GlobalExceptionHandler.handleResourceNotFound()
+================================================================================

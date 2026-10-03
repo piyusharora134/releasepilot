@@ -1,10 +1,8 @@
 package com.releasepilot;
 
 import org.junit.jupiter.api.Test;
-import org.springframework.boot.test.context.SpringBootTest;
 
-@SpringBootTest
-class ReleasepilotApplicationTests {
+class ReleasepilotApplicationTests extends AbstractIntegrationTest {
 
 	@Test
 	void contextLoads() {
