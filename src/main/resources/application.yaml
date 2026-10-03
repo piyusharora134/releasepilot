@@ -1,5 +1,5 @@
 server:
-  port: 8080
+  port: ${PORT:8080}
 
 spring:
   application:
@@ -29,8 +29,8 @@ spring:
       port: ${REDIS_PORT:6379}
 
 jwt:
-  secret: ${JWT_SECRET:404E635266556A586E3272357538782F413F4428472B4B6250645367566B5970}
-  expiration-ms: 86400000 # 24 hours
+  secret: ${JWT_SECRET}
+  expiration-ms: 86400000
 
 releasepilot:
   cache:
